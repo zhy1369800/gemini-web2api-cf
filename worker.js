@@ -27,9 +27,10 @@
  *   RETRY_ATTEMPTS / RETRY_DELAY_SEC / REQUEST_TIMEOUT_SEC   整数
  *   LOG_REQUESTS         true/false
  *
- * 限制(与上游一致):不支持图片/多模态输入 —— Gemini 的上传走的是私有流式 RPC,
- * 模型在这里无法解码,因此图片会被替换成一段文字提示。`gemini-3.1-pro` 只有在带
- * 付费账号 cookie 时才会真正路由到 Pro,否则回退到 Flash。
+ * 限制:图片/多模态输入需要登录态 —— 设置了 GEMINI_COOKIE 时,图片会经 Scotty
+ * 上传到 Gemini 再绑进会话;未设置 cookie 时图片会被忽略(匿名带图会被后端以
+ * 1100 拒绝),并在 prompt 里加一句提示。`gemini-3.1-pro` 也只有带付费账号 cookie
+ * 时才会真正路由到 Pro,否则回退到 Flash。
  */
 
 const VERSION = "1.1.0-worker";
@@ -233,8 +234,10 @@ function tokenEst(s) {
 function buildPayload(prompt, modelId, thinkMode, fileRefs, extra) {
   const inner = new Array(102).fill(null);
   if (fileRefs && fileRefs.length) {
-    const refs = fileRefs.map((ref) => [null, null, ref]);
-    inner[0] = [prompt, 0, null, refs, null, null, 0];
+    // 每个上传文件表示为 [[fileRef, 1], filename](格式来自 gemini_webapi,
+    // 已实测能被后端接受 —— 详见 test/live-image.mjs 的诊断)。
+    const files = fileRefs.map((ref) => [[ref, 1], "image.png"]);
+    inner[0] = [prompt, 0, null, files, null, null, 0];
   } else {
     inner[0] = [prompt, 0, null, null, null, null, 0];
   }
@@ -281,6 +284,112 @@ async function buildHeaders(cfg) {
   if (cfg.cookie) headers["Cookie"] = cfg.cookie;
   if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
   return headers;
+}
+
+// ─── 多模态:图片上传(Scotty 续传)───────────────────────────────────────────
+// 说明:图片输入需要登录态(GEMINI_COOKIE)。匿名会话上传文件能成功,但带图
+// 生成会被后端以 BardErrorInfo[1100] 拒绝(权限门)。无 cookie 时不上传,
+// 改为在 prompt 里追加一句提示,降级为纯文本。详见 test/live-image.mjs。
+
+const _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+let _pageTokens = { tokens: null, ts: 0 };
+
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// 解析 OpenAI image_url:data:URL(base64)或 http(s) URL。返回 {b64,mime} 或 {url} 或 null。
+function parseImageUrl(url) {
+  if (!url || typeof url !== "string") return null;
+  const m = /^data:([^;,]+);base64,([\s\S]*)$/.exec(url);
+  if (m) return { b64: m[2], mime: m[1] || "image/png" };
+  if (/^https?:\/\//.test(url)) return { url };
+  return null;
+}
+
+// 抓取 gemini.google.com/app 页面里的上传 token(带 10 分钟缓存)。
+async function getPageTokens(cfg) {
+  const now = Date.now();
+  if (_pageTokens.tokens && now - _pageTokens.ts < 600000) return _pageTokens.tokens;
+  const headers = { "User-Agent": _UA };
+  if (cfg.cookie) headers["Cookie"] = cfg.cookie;
+  const tokens = {};
+  try {
+    const resp = await fetch("https://gemini.google.com/app", { headers });
+    const html = await resp.text();
+    for (const [k, re] of [["push_id", /"qKIAYe":"([^"]+)"/], ["pctx", /"Ylro7b":"([^"]+)"/]]) {
+      const mm = re.exec(html);
+      if (mm) tokens[k] = mm[1];
+    }
+  } catch (e) {
+    /* 用默认值兜底 */
+  }
+  _pageTokens = { tokens, ts: now };
+  return tokens;
+}
+
+// Scotty 续传上传一张图,返回文件引用(形如 "/contrib_service/ttl_1d/...")。
+async function uploadImage(cfg, bytes, mime) {
+  const tokens = await getPageTokens(cfg);
+  const pushId = tokens.push_id || "feeds/mcudyrk2a4khkz";
+  const pctx = tokens.pctx || "CgcSBWjK7pYx";
+
+  const startHeaders = {
+    "Push-ID": pushId,
+    "X-Tenant-Id": "bard-storage",
+    "X-Client-Pctx": pctx,
+    "X-Goog-Upload-Header-Content-Length": String(bytes.length),
+    "X-Goog-Upload-Header-Content-Type": mime,
+    "X-Goog-Upload-Protocol": "resumable",
+    "X-Goog-Upload-Command": "start",
+    "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+    "User-Agent": _UA,
+  };
+  if (cfg.cookie) startHeaders["Cookie"] = cfg.cookie;
+  if (cfg.sapisid) startHeaders["Authorization"] = await makeSapisidHash(cfg.sapisid);
+
+  const r1 = await fetch("https://content-push.googleapis.com/upload/", { method: "POST", headers: startHeaders, body: "" });
+  const uploadUrl = r1.headers.get("x-goog-upload-url");
+  if (!uploadUrl) throw new Error(`no upload URL (status ${r1.status})`);
+
+  const r2 = await fetch(uploadUrl, {
+    method: "POST",
+    headers: { "X-Goog-Upload-Command": "upload, finalize", "X-Goog-Upload-Offset": "0", "Content-Type": "application/octet-stream", "User-Agent": _UA },
+    body: bytes,
+  });
+  const fileRef = (await r2.text()).trim();
+  if (!fileRef.startsWith("/")) throw new Error(`invalid file ref: ${fileRef.slice(0, 120)}`);
+  return fileRef;
+}
+
+// 把收集到的图片解析/上传成文件引用。返回 { fileRefs, droppedNote }。
+// 无 cookie 时不上传(会被 1100 拒),改为返回一段提示文字追加到 prompt。
+async function resolveImages(cfg, images) {
+  if (!images || !images.length) return { fileRefs: null, droppedNote: "" };
+  if (!cfg.cookie) {
+    return { fileRefs: null, droppedNote: `\n\n[Note: ${images.length} image(s) were provided but ignored — image input requires a configured GEMINI_COOKIE.]` };
+  }
+  const refs = [];
+  for (const img of images) {
+    try {
+      let bytes, mime;
+      if (img.url) {
+        const r = await fetch(img.url, { signal: timeoutSignal(cfg.request_timeout_sec * 1000) });
+        bytes = new Uint8Array(await r.arrayBuffer());
+        mime = img.mime || r.headers.get("content-type") || "image/png";
+      } else {
+        bytes = base64ToBytes(img.b64);
+        mime = img.mime || "image/png";
+      }
+      refs.push(await uploadImage(cfg, bytes, mime));
+    } catch (e) {
+      log(cfg, `image upload failed: ${e}`);
+    }
+  }
+  return { fileRefs: refs.length ? refs : null, droppedNote: "" };
 }
 
 function stripArtifacts(text) {
@@ -332,8 +441,8 @@ function extractResponseText(raw) {
 }
 
 /** 非流式生成(带重试)。返回最终的响应文本。 */
-async function generate(cfg, prompt, modelId, thinkMode, extra) {
-  const body = buildPayload(prompt, modelId, thinkMode, null, extra);
+async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
+  const body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra);
   const url = getUrl(cfg);
   const headers = await buildHeaders(cfg);
   let lastErr;
@@ -363,8 +472,8 @@ async function generate(cfg, prompt, modelId, thinkMode, extra) {
  * 流式生成。每步 yield 一段文本增量(本次新追加的后缀)。
  * 只在尚未 yield 过任何内容时才重试,以避免重复输出。
  */
-async function* generateStream(cfg, prompt, modelId, thinkMode, extra) {
-  const body = buildPayload(prompt, modelId, thinkMode, null, extra);
+async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
+  const body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra);
   const url = getUrl(cfg);
   const headers = await buildHeaders(cfg);
   let lastErr;
@@ -488,8 +597,18 @@ function messagesToPrompt(messages, tools, toolChoice) {
         const t = c && c.type;
         if (t === "text" || t === "input_text") {
           textParts.push(c.text || "");
-        } else if (t === "image_url" || t === "image") {
-          textParts.push("[Note: Image input not supported in this API. Please describe the image in text.]");
+        } else if (t === "image_url") {
+          const u = c.image_url && (c.image_url.url || c.image_url);
+          const img = parseImageUrl(typeof u === "string" ? u : "");
+          if (img) images.push(img);
+        } else if (t === "image") {
+          // 兼容 Anthropic 风格 {source:{type:"base64",media_type,data}}
+          if (c.source && c.source.data) {
+            images.push({ b64: c.source.data, mime: c.source.media_type || "image/png" });
+          } else if (c.image_url) {
+            const img = parseImageUrl(typeof c.image_url === "string" ? c.image_url : c.image_url.url || "");
+            if (img) images.push(img);
+          }
         }
       }
       content = textParts.join(" ");
@@ -618,7 +737,7 @@ function googleContentsToPrompt(req) {
       if (p.text) {
         msgParts.push(p.text);
       } else if (p.inlineData) {
-        msgParts.push("[Note: Image input not supported in this API. Please describe the image in text.]");
+        images.push({ b64: p.inlineData.data, mime: p.inlineData.mimeType || "image/png" });
       } else if (p.functionCall) {
         const fc = p.functionCall;
         msgParts.push("```function_call\n" + JSON.stringify({ name: fc.name, args: fc.args || {} }) + "\n```");
@@ -686,12 +805,20 @@ function parseJson(text) {
   }
 }
 
-function authorized(request, cfg) {
+// 从多种来源取调用方 key:Bearer / x-api-key / x-goog-api-key / ?key=
+// (分别兼容 OpenAI 客户端、Anthropic 风格、Gemini CLI)。任一匹配即放行。
+function authorized(request, url, cfg) {
   const keys = cfg.api_keys || [];
   if (!keys.length) return true;
-  const auth = request.headers.get("authorization") || "";
-  const key = auth.startsWith("Bearer ") ? auth.slice(7) : (request.headers.get("x-api-key") || "");
-  return keys.includes(key);
+  const h = request.headers;
+  const auth = h.get("authorization") || "";
+  const candidates = [
+    auth.startsWith("Bearer ") ? auth.slice(7) : null,
+    h.get("x-api-key"),
+    h.get("x-goog-api-key"),
+    url ? url.searchParams.get("key") : null,
+  ];
+  return candidates.some((k) => k && keys.includes(k));
 }
 
 /**
@@ -731,7 +858,9 @@ async function handleChat(req, cfg) {
 
   const tools = req.tools;
   const toolChoice = req.tool_choice != null ? req.tool_choice : "auto";
-  const [prompt] = messagesToPrompt(req.messages || [], tools, toolChoice);
+  const [prompt0, images] = messagesToPrompt(req.messages || [], tools, toolChoice);
+  const { fileRefs, droppedNote } = await resolveImages(cfg, images);
+  const prompt = prompt0 + droppedNote;
   if (!prompt.trim()) return jsonResponse({ error: { message: "empty prompt" } }, 400);
 
   const stream = req.stream || false;
@@ -740,7 +869,7 @@ async function handleChat(req, cfg) {
   if (stream && (!tools || toolChoice === "none")) {
     return sseResponse(async (write) => {
       try {
-        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra)) {
+        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs)) {
           write(`data: ${JSON.stringify({
             id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
             choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
@@ -758,7 +887,7 @@ async function handleChat(req, cfg) {
 
   let text;
   try {
-    text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra);
+    text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
   }
@@ -856,12 +985,14 @@ async function handleResponses(req, cfg) {
   }
 
   const toolChoice = req.tool_choice != null ? req.tool_choice : "auto";
-  const [prompt] = messagesToPrompt(messages, tools, toolChoice);
+  const [prompt0, images] = messagesToPrompt(messages, tools, toolChoice);
+  const { fileRefs, droppedNote } = await resolveImages(cfg, images);
+  const prompt = prompt0 + droppedNote;
   if (!prompt.trim()) return jsonResponse({ error: { message: "empty input" } }, 400);
 
   let text;
   try {
-    text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra);
+    text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
   }
@@ -915,7 +1046,9 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
 
   const fcMode = ((req.toolConfig || {}).functionCallingConfig || {}).mode || "AUTO";
   const hasTools = !!req.tools && fcMode !== "NONE";
-  const [prompt] = googleContentsToPrompt(req);
+  const [prompt0, images] = googleContentsToPrompt(req);
+  const { fileRefs, droppedNote } = await resolveImages(cfg, images);
+  const prompt = prompt0 + droppedNote;
   if (!prompt.trim()) return jsonResponse({ error: { message: "empty content" } }, 400);
 
   log(cfg, `Google API: model=${rm.name} stream=${stream} tools=${hasTools} prompt_len=${prompt.length}`);
@@ -924,7 +1057,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
     return sseResponse(async (write) => {
       let fullText = "";
       try {
-        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra)) {
+        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs)) {
           if (!delta) continue;
           fullText += delta;
           write(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: delta }], role: "model" }, index: 0 }], modelVersion: rm.name })}\n\n`);
@@ -941,7 +1074,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
 
   let text;
   try {
-    text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra);
+    text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
   }
@@ -987,8 +1120,9 @@ export default {
       });
     }
 
-    // 只有 /v1/* 需要鉴权(与上游一致;/v1beta/* 对 Gemini CLI 开放)。
-    if (path.startsWith("/v1/") && !authorized(request, cfg)) {
+    // 鉴权:配置了 API_KEYS 时,除健康检查 "/" 外的所有接口都需要有效 key
+    // (含 /v1/* 与 /v1beta/*,防止 Google 原生端点被绕过白嫖)。
+    if (path !== "/" && !authorized(request, url, cfg)) {
       return jsonResponse({ error: { message: "invalid api key" } }, 401);
     }
 
@@ -1047,5 +1181,5 @@ export {
   MODELS, resolveModel, getConfig, buildPayload, getUrl, buildHeaders, cleanText,
   extractTextsFromLine, extractResponseText, generate, generateStream,
   messagesToPrompt, parseToolCalls, googleContentsToPrompt, parseGoogleFunctionCalls,
-  makeSapisidHash,
+  makeSapisidHash, parseImageUrl, getPageTokens, uploadImage, resolveImages,
 };
