@@ -23,6 +23,8 @@
  *   SAPISID              可选,显式指定 SAPISID(否则从 cookie 自动提取)
  *   API_KEYS             逗号分隔的列表或 JSON 数组;为空 = 不鉴权
  *   GEMINI_BL            Gemini 网页版构建号(会随时间变化)
+ *   GEMINI_ORIGIN        上游源站;部署被 Google 429 限流时,指向干净 IP 的反向代理
+ *   UPSTREAM_SOCKET      true/false;true=上游优先用裸 socket(绕开 fetch 的 429)
  *   DEFAULT_MODEL        默认模型名
  *   RETRY_ATTEMPTS / RETRY_DELAY_SEC / REQUEST_TIMEOUT_SEC   整数
  *   LOG_REQUESTS         true/false
@@ -54,6 +56,16 @@ const CONFIG = {
   // Gemini 网页版构建号。如果返回开始变空,去 gemini.google.com 页面源码里
   // 找一个新的值("boq_assistant-bard-web-server_...")。
   GEMINI_BL: "boq_assistant-bard-web-server_20260525.09_p0",
+
+  // 上游源站。默认直连 gemini.google.com。若部署在 Cloudflare/无服务器平台
+  // 被 Google 以 429 限流(出口 IP 被拦),把它指向一个跑在“干净 IP”上的反向
+  // 代理(转发到 gemini.google.com 并保留 Host/Origin),即可绕开。例:
+  //   GEMINI_ORIGIN = "https://your-relay.example.com"
+  GEMINI_ORIGIN: "https://gemini.google.com",
+
+  // 上游请求是否优先用裸 socket(cloudflare:sockets)绕开 fetch 的 429 限流。
+  // true=优先 socket,不可用/失败再回退 fetch;false=只用 fetch。
+  UPSTREAM_SOCKET: true,
 
   DEFAULT_MODEL: "gemini-3.5-flash",
   RETRY_ATTEMPTS: 3,
@@ -151,6 +163,8 @@ function getConfig(env) {
   }
   return {
     gemini_bl: envOr(env, "GEMINI_BL", CONFIG.GEMINI_BL),
+    gemini_origin: String(envOr(env, "GEMINI_ORIGIN", CONFIG.GEMINI_ORIGIN)).replace(/\/$/, ""),
+    upstream_socket: parseBool(envOr(env, "UPSTREAM_SOCKET", CONFIG.UPSTREAM_SOCKET), true),
     default_model: envOr(env, "DEFAULT_MODEL", CONFIG.DEFAULT_MODEL),
     retry_attempts: parseIntDefault(envOr(env, "RETRY_ATTEMPTS", CONFIG.RETRY_ATTEMPTS), 3),
     retry_delay_sec: parseIntDefault(envOr(env, "RETRY_DELAY_SEC", CONFIG.RETRY_DELAY_SEC), 2),
@@ -266,9 +280,10 @@ function buildPayload(prompt, modelId, thinkMode, fileRefs, extra) {
 
 function getUrl(cfg) {
   const reqid = nowSec() % 1000000;
+  const origin = (cfg.gemini_origin || "https://gemini.google.com").replace(/\/$/, "");
   return (
-    "https://gemini.google.com/_/BardChatUi/data/" +
-    "assistant.lamda.BardFrontendService/StreamGenerate" +
+    origin +
+    "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate" +
     `?bl=${encodeURIComponent(cfg.gemini_bl)}&hl=en&_reqid=${reqid}&rt=c`
   );
 }
@@ -284,6 +299,158 @@ async function buildHeaders(cfg) {
   if (cfg.cookie) headers["Cookie"] = cfg.cookie;
   if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
   return headers;
+}
+
+// ─── Socket 上游(绕开 fetch)──────────────────────────────────────────────────
+// Cloudflare Workers 的 fetch 子请求走共享出口、易被 Google 429。改用
+// cloudflare:sockets 的 connect() 裸 TCP+TLS 自行拼 HTTP/1.1,出口路径不同,
+// 常能避开限流。Node(测试)拿不到该模块 -> resolveConnect() 返回 null -> 回退 fetch。
+let _connect; // undefined=未解析, null=不可用, function=可用
+async function resolveConnect() {
+  if (_connect !== undefined) return _connect;
+  try {
+    const mod = await import("cloudflare:sockets");
+    _connect = mod.connect || null;
+  } catch (_) {
+    _connect = null;
+  }
+  return _connect;
+}
+// 测试注入(Node 用 tls 模拟 connect();传 null 可强制走 fetch)。
+function __setConnect(fn) { _connect = fn === undefined ? null : fn; }
+
+function _concatBytes(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+function _findCRLF(buf, from) {
+  for (let i = from; i + 1 < buf.length; i++) if (buf[i] === 13 && buf[i + 1] === 10) return i;
+  return -1;
+}
+function _findDoubleCRLF(buf) {
+  for (let i = 0; i + 3 < buf.length; i++) {
+    if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) return i;
+  }
+  return -1;
+}
+
+// 用裸 socket 发一个 HTTP/1.1 请求,返回类 Response 对象:{status, ok, headers, body, text()}。
+// body 是已解码(去 chunked、identity 编码)的 ReadableStream<Uint8Array>,支持流式。
+async function socketHttp(connect, url, { method = "GET", headers = {}, body, timeoutMs = 180000 } = {}) {
+  const u = new URL(url);
+  const secure = u.protocol !== "http:";
+  const port = u.port ? Number(u.port) : (secure ? 443 : 80);
+  const socket = connect({ hostname: u.hostname, port }, { secureTransport: secure ? "on" : "off", allowHalfOpen: false });
+
+  let timer = null;
+  if (timeoutMs) timer = setTimeout(() => { try { socket.close(); } catch (_) {} }, timeoutMs);
+
+  const enc = new TextEncoder();
+  const bodyBytes = body == null ? null : (typeof body === "string" ? enc.encode(body) : new Uint8Array(body));
+  // 自管 Host/Connection/Accept-Encoding(identity 避免 gzip)/Content-Length
+  const reqHeaders = { Host: u.hostname, "Accept-Encoding": "identity", Connection: "close" };
+  for (const [k, v] of Object.entries(headers)) {
+    if (/^(host|connection|accept-encoding|content-length)$/i.test(k)) continue;
+    reqHeaders[k] = v;
+  }
+  if (bodyBytes) reqHeaders["Content-Length"] = String(bodyBytes.length);
+  let head = `${method} ${u.pathname}${u.search} HTTP/1.1\r\n`;
+  for (const [k, v] of Object.entries(reqHeaders)) head += `${k}: ${v}\r\n`;
+  head += "\r\n";
+
+  const writer = socket.writable.getWriter();
+  await writer.write(enc.encode(head));
+  if (bodyBytes) await writer.write(bodyBytes);
+  try { writer.releaseLock(); } catch (_) {}
+
+  const reader = socket.readable.getReader();
+  let buf = new Uint8Array(0);
+  let he = -1;
+  while (he < 0) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf = _concatBytes(buf, value);
+    he = _findDoubleCRLF(buf);
+  }
+  if (he < 0) { if (timer) clearTimeout(timer); throw new Error("socket: incomplete HTTP response headers"); }
+  const headerText = new TextDecoder().decode(buf.slice(0, he));
+  let pending = buf.slice(he + 4);
+  const hlines = headerText.split("\r\n");
+  const status = parseInt((hlines[0] || "").split(" ")[1], 10) || 0;
+  const respHeaders = new Headers();
+  for (let i = 1; i < hlines.length; i++) {
+    const c = hlines[i].indexOf(":");
+    if (c > 0) { try { respHeaders.append(hlines[i].slice(0, c).trim(), hlines[i].slice(c + 1).trim()); } catch (_) {} }
+  }
+  const chunked = /chunked/i.test(respHeaders.get("transfer-encoding") || "");
+  const clen = respHeaders.has("content-length") ? parseInt(respHeaders.get("content-length"), 10) : null;
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const pull = async () => {
+        const { done, value } = await reader.read();
+        if (done) return false;
+        pending = _concatBytes(pending, value);
+        return true;
+      };
+      try {
+        if (chunked) {
+          for (;;) {
+            let nl = _findCRLF(pending, 0);
+            while (nl < 0) { if (!(await pull())) { controller.close(); return; } nl = _findCRLF(pending, 0); }
+            const size = parseInt(new TextDecoder().decode(pending.slice(0, nl)).trim().split(";")[0], 16);
+            pending = pending.slice(nl + 2);
+            if (!size || Number.isNaN(size)) { controller.close(); return; } // 末块 0
+            while (pending.length < size + 2) { if (!(await pull())) break; }
+            controller.enqueue(pending.slice(0, size));
+            pending = pending.slice(size + 2); // 跳过块尾 \r\n
+          }
+        } else if (clen != null) {
+          let got = 0;
+          if (pending.length) { const t = pending.slice(0, clen); controller.enqueue(t); got += t.length; pending = pending.slice(t.length); }
+          while (got < clen) { const { done, value } = await reader.read(); if (done) break; const need = clen - got; const t = value.length > need ? value.slice(0, need) : value; controller.enqueue(t); got += t.length; }
+          controller.close();
+        } else {
+          if (pending.length) controller.enqueue(pending);
+          for (;;) { const { done, value } = await reader.read(); if (done) break; controller.enqueue(value); }
+          controller.close();
+        }
+      } catch (e) {
+        controller.error(e);
+      } finally {
+        if (timer) clearTimeout(timer);
+        try { reader.releaseLock(); } catch (_) {}
+        try { socket.close(); } catch (_) {}
+      }
+    },
+    cancel() { if (timer) clearTimeout(timer); try { socket.close(); } catch (_) {} },
+  });
+
+  const res = { status, ok: status >= 200 && status < 300, headers: respHeaders, body: stream };
+  res.text = async () => {
+    const r = stream.getReader();
+    let acc = new Uint8Array(0);
+    for (;;) { const { done, value } = await r.read(); if (done) break; acc = _concatBytes(acc, value); }
+    return new TextDecoder().decode(acc);
+  };
+  return res;
+}
+
+// 统一上游入口:socket 优先,失败/不可用则回退 fetch。返回类 Response 对象。
+async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 180000, socket = true } = {}) {
+  if (socket) {
+    const connect = await resolveConnect();
+    if (connect) {
+      try {
+        return await socketHttp(connect, url, { method, headers, body, timeoutMs });
+      } catch (e) {
+        // socket 连接层失败(非 HTTP 错误)-> 回退 fetch
+      }
+    }
+  }
+  return fetch(url, { method, headers, body, signal: timeoutSignal(timeoutMs) });
 }
 
 // ─── 多模态:图片上传(Scotty 续传)───────────────────────────────────────────
@@ -318,7 +485,7 @@ async function getPageTokens(cfg) {
   if (cfg.cookie) headers["Cookie"] = cfg.cookie;
   const tokens = {};
   try {
-    const resp = await fetch("https://gemini.google.com/app", { headers });
+    const resp = await httpFetch(`${cfg.gemini_origin || "https://gemini.google.com"}/app`, { headers, timeoutMs: 30000, socket: cfg.upstream_socket });
     const html = await resp.text();
     for (const [k, re] of [["push_id", /"qKIAYe":"([^"]+)"/], ["pctx", /"Ylro7b":"([^"]+)"/]]) {
       const mm = re.exec(html);
@@ -351,14 +518,16 @@ async function uploadImage(cfg, bytes, mime) {
   if (cfg.cookie) startHeaders["Cookie"] = cfg.cookie;
   if (cfg.sapisid) startHeaders["Authorization"] = await makeSapisidHash(cfg.sapisid);
 
-  const r1 = await fetch("https://content-push.googleapis.com/upload/", { method: "POST", headers: startHeaders, body: "" });
+  const r1 = await httpFetch("https://content-push.googleapis.com/upload/", { method: "POST", headers: startHeaders, body: "", timeoutMs: 30000, socket: cfg.upstream_socket });
   const uploadUrl = r1.headers.get("x-goog-upload-url");
   if (!uploadUrl) throw new Error(`no upload URL (status ${r1.status})`);
 
-  const r2 = await fetch(uploadUrl, {
+  const r2 = await httpFetch(uploadUrl, {
     method: "POST",
     headers: { "X-Goog-Upload-Command": "upload, finalize", "X-Goog-Upload-Offset": "0", "Content-Type": "application/octet-stream", "User-Agent": _UA },
     body: bytes,
+    timeoutMs: 60000,
+    socket: cfg.upstream_socket,
   });
   const fileRef = (await r2.text()).trim();
   if (!fileRef.startsWith("/")) throw new Error(`invalid file ref: ${fileRef.slice(0, 120)}`);
@@ -448,15 +617,19 @@ async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
   let lastErr;
   for (let attempt = 0; attempt < cfg.retry_attempts; attempt++) {
     try {
-      const resp = await fetch(url, {
+      const resp = await httpFetch(url, {
         method: "POST",
         headers,
         body,
-        signal: timeoutSignal(cfg.request_timeout_sec * 1000),
+        timeoutMs: cfg.request_timeout_sec * 1000,
+        socket: cfg.upstream_socket,
       });
       const raw = await resp.text();
-      if (!resp.ok) log(cfg, `upstream status ${resp.status}`);
-      return extractResponseText(raw);
+      const text = extractResponseText(raw);
+      if (!resp.ok || !text) {
+        log(cfg, `upstream status=${resp.status} rawLen=${raw.length} parsedLen=${text.length} snippet=${JSON.stringify(raw.slice(0, 200))}`);
+      }
+      return text;
     } catch (e) {
       lastErr = e;
       if (attempt < cfg.retry_attempts - 1) {
@@ -481,11 +654,12 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
 
   for (let attempt = 0; attempt < cfg.retry_attempts; attempt++) {
     try {
-      const resp = await fetch(url, {
+      const resp = await httpFetch(url, {
         method: "POST",
         headers,
         body,
-        signal: timeoutSignal(cfg.request_timeout_sec * 1000),
+        timeoutMs: cfg.request_timeout_sec * 1000,
+        socket: cfg.upstream_socket,
       });
       if (!resp.body) {
         const text = extractResponseText(await resp.text());
@@ -499,17 +673,20 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
       const decoder = new TextDecoder();
       let buf = "";
       let prev = "";
+      let started = false; // 是否已 yield 过非空内容(用于裁掉开头的空白)
       const consumeLine = function* (line) {
         for (const t of extractTextsFromLine(line)) {
           if (t.length > prev.length) {
-            // 每段增量:去掉残留标记,但流式过程中不裁剪空白,
+            // 每段增量:去掉残留标记,但流式过程中不裁剪内部空白,
             // 以保留分块之间的空格(比如 "1, 2, 3" 而不是 "1, 2,3")。
-            // 只有第一段增量会裁掉它的前导空白。
-            const isFirst = prev === "";
+            // 在首个可见内容出现前,持续裁掉前导空白(避免开头空行)。
             let delta = stripArtifacts(t.slice(prev.length));
             prev = t;
-            if (isFirst) delta = delta.replace(/^\s+/, "");
-            if (delta) yield delta;
+            if (!started) delta = delta.replace(/^\s+/, "");
+            if (delta) {
+              started = true;
+              yield delta;
+            }
           }
         }
       };
@@ -534,6 +711,7 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
           yield delta;
         }
       }
+      if (!yielded) log(cfg, `stream upstream produced no text (status=${resp.status})`);
       return;
     } catch (e) {
       lastErr = e;
@@ -851,6 +1029,15 @@ function sseResponse(producer) {
 
 // ─── 处理函数 ──────────────────────────────────────────────────────────────────
 
+// 上游返回为空时给客户端的可见提示(否则像 Cherry 这类客户端会“无返回”)。
+// 线上常见原因:部署在 Cloudflare/无服务器平台时,出口 IP 被 Google 区别对待
+// (本地能跑、线上空);其次是 GEMINI_BL 过期。用 `wrangler tail` 看上游状态。
+const EMPTY_UPSTREAM_MSG =
+  "⚠️ Upstream Gemini returned an empty response. " +
+  "If this Worker runs on Cloudflare/serverless, Google may be blocking the egress IP " +
+  "(works locally but empty in production); also verify GEMINI_BL is current. " +
+  "Run `wrangler tail` to see the upstream status.";
+
 // POST /v1/chat/completions
 async function handleChat(req, cfg) {
   const rm = resolveModel(req.model || cfg.default_model, cfg.default_model);
@@ -868,18 +1055,26 @@ async function handleChat(req, cfg) {
 
   if (stream && (!tools || toolChoice === "none")) {
     return sseResponse(async (write) => {
+      let got = false;
+      let errMsg = "";
+      const chunk = (delta, finish) => write(`data: ${JSON.stringify({
+        id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
+        choices: [{ index: 0, delta, finish_reason: finish }],
+      })}\n\n`);
       try {
         for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs)) {
-          write(`data: ${JSON.stringify({
-            id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
-            choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-          })}\n\n`);
+          got = true;
+          chunk({ content: delta }, null);
         }
+      } catch (e) {
+        errMsg = `⚠️ upstream error: ${e}`;
       } finally {
-        write(`data: ${JSON.stringify({
-          id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        })}\n\n`);
+        if (!got) {
+          const note = errMsg || EMPTY_UPSTREAM_MSG;
+          log(cfg, `chat stream produced no content -> ${note}`);
+          chunk({ content: note }, null); // 让客户端看到原因,而非空白
+        }
+        chunk({}, "stop");
         write("data: [DONE]\n\n");
       }
     });
@@ -897,6 +1092,10 @@ async function handleChat(req, cfg) {
     const [clean, tc] = parseToolCalls(text);
     text = clean;
     toolCalls = tc.length ? tc : null;
+  }
+  if (!text && !toolCalls) {
+    log(cfg, "chat non-stream produced no content (empty upstream)");
+    text = EMPTY_UPSTREAM_MSG; // 可见提示,避免客户端“无返回”
   }
   const msg = { role: "assistant", content: text || null };
   if (toolCalls) msg.tool_calls = toolCalls;
@@ -1105,6 +1304,72 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
   return jsonResponse(responseObj);
 }
 
+// GET /debug — 排查上游为何为空。从【当前部署环境】实地探测,回显原始状态/片段。
+// 探针 A:裸请求(现行做法);探针 B:先抓访客 cookie + at token 再请求。
+// 对比两者即可判断:是 IP 被拦(都空)、还是缺会话(B 能通 → 可自动修)。
+async function handleDebug(cfg) {
+  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+
+  async function probe(guest) {
+    try {
+      let cookie = cfg.cookie || "";
+      let at = "";
+      let bl = cfg.gemini_bl;
+      let pageStatus = null;
+      let setCookieCount = 0;
+      if (guest && !cookie) {
+        const pr = await httpFetch(`${cfg.gemini_origin}/app`, { headers: { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9" }, timeoutMs: 30000, socket: cfg.upstream_socket });
+        pageStatus = pr.status;
+        const sc = pr.headers.getSetCookie ? pr.headers.getSetCookie() : [];
+        setCookieCount = sc.length;
+        cookie = sc.map((c) => c.split(";")[0]).filter(Boolean).join("; ");
+        const html = await pr.text();
+        at = (/"SNlM0e":"([^"]+)"/.exec(html) || [])[1] || "";
+        const blm = /"cfb2h":"([^"]+)"/.exec(html);
+        if (blm) bl = blm[1];
+      }
+      const headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://gemini.google.com",
+        "Referer": "https://gemini.google.com/app",
+        "X-Same-Domain": "1",
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9",
+      };
+      if (cookie) headers["Cookie"] = cookie;
+      if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
+      let body = buildPayload("Reply with one word: PONG", 1, 4, null, null);
+      if (at) body += "&at=" + encodeURIComponent(at);
+      const resp = await httpFetch(getUrl({ gemini_bl: bl, gemini_origin: cfg.gemini_origin }), { method: "POST", headers, body, timeoutMs: 60000, socket: cfg.upstream_socket });
+      const raw = await resp.text();
+      return {
+        status: resp.status,
+        contentType: resp.headers.get("content-type"),
+        rawLength: raw.length,
+        parsed: extractResponseText(raw).slice(0, 160),
+        rawSnippet: raw.slice(0, 500),
+        usedCookie: !!cookie,
+        usedAt: !!at,
+        blUsed: bl,
+        pageStatus,
+        setCookieCount,
+      };
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  }
+
+  return jsonResponse({
+    note: "上游已改用 socket(cloudflare:sockets)优先、fetch 兜底。socket.available=false 表示运行时没有该模块、退回 fetch。A=bare, B=guest. 若 status 仍是 429,说明 socket 出口同样被 Google 限流 -> 用 GEMINI_ORIGIN 中转或换非数据中心 IP。",
+    bl: cfg.gemini_bl,
+    geminiOrigin: cfg.gemini_origin,
+    hasCookie: !!cfg.cookie,
+    socket: { configEnabled: cfg.upstream_socket, available: !!(await resolveConnect()) },
+    A_bare: await probe(false),
+    B_guest: await probe(true),
+  });
+}
+
 // ─── 路由 ────────────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
@@ -1141,6 +1406,9 @@ export default {
         }
         if (path === "/") {
           return jsonResponse({ status: "ok", version: VERSION, models: Object.keys(MODELS) });
+        }
+        if (path === "/debug") {
+          return await handleDebug(cfg);
         }
         return jsonResponse({ error: "not found" }, 404);
       }
@@ -1182,4 +1450,5 @@ export {
   extractTextsFromLine, extractResponseText, generate, generateStream,
   messagesToPrompt, parseToolCalls, googleContentsToPrompt, parseGoogleFunctionCalls,
   makeSapisidHash, parseImageUrl, getPageTokens, uploadImage, resolveImages,
+  __setConnect, httpFetch, socketHttp,
 };
